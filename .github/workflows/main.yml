@@ -116,7 +116,3 @@ jobs:
               Write-Host "[$(Get-Date)] Active"
               Start-Sleep -Seconds 600
           }
-
-      - name: Cleanup
-        if: always()
-        shell: pw

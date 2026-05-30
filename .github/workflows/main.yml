@@ -1,0 +1,131 @@
+name: RDP-Kali
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 */4 * * *'
+
+concurrency:
+  group: tailscale-exit-node
+  cancel-in-progress: true
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Enable RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User
+        shell: pwsh
+        run: |
+          try { Remove-LocalUser -Name "AdminRDP" -ErrorAction SilentlyContinue } catch {}
+          
+          $chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+          $password = -join ((1..16) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
+          $password = $password + "A1!"
+          
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "AdminRDP" -Password $securePass -AccountNeverExpires -FullName "Admin RDP"
+          Add-LocalGroupMember -Group "Administrators" -Member "AdminRDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "AdminRDP" -ErrorAction SilentlyContinue
+          
+          "RDP_USER=AdminRDP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RDP_PASS=$password" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Setup WSL Kali Linux
+        shell: pwsh
+        run: |
+          Write-Host "[1] Install WSL Kali Linux..."
+          wsl --install -d kali-linux
+          Start-Sleep -Seconds 15
+          
+          Write-Host "[2] Setup user RDP..."
+          wsl -d kali-linux -u root bash -c "useradd -m -s /bin/bash RDP && echo 'RDP:kali' | chpasswd && usermod -aG sudo RDP"
+          wsl -d kali-linux -u root bash -c "echo -e '[user]\ndefault=RDP' > /etc/wsl.conf"
+          wsl -t kali-linux
+          Start-Sleep -Seconds 3
+          
+          Write-Host "[3] Update & upgrade Kali..."
+          wsl -d kali-linux -u root bash -c "export DEBIAN_FRONTEND=noninteractive && apt update -y && apt full-upgrade -y"
+          
+          Write-Host "[4] Install Kali tools..."
+          wsl -d kali-linux -u root bash -c "apt install -y kali-linux-headless 2>/dev/null"
+          
+          Write-Host "[+] KALI SIAP!"
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name "IPEnableRouter" -Value 1
+
+          Invoke-WebRequest https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi -OutFile ts.msi
+
+          $installProcess = Start-Process msiexec.exe -ArgumentList "/i ts.msi /quiet /norestart" -Wait -PassThru -NoNewWindow
+          $installProcess.WaitForExit()
+
+          $searchPaths = @(
+            "$env:ProgramFiles\Tailscale\tailscale.exe",
+            "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe",
+            "C:\Program Files\Tailscale\tailscale.exe",
+            "C:\Program Files (x86)\Tailscale\tailscale.exe"
+          )
+
+          $ts = $null
+          $retry = 0
+          while (-not $ts -and $retry -lt 15) {
+              foreach ($p in $searchPaths) { if (Test-Path $p) { $ts = $p; break } }
+              if (-not $ts) { Start-Sleep -Seconds 2; $retry++ }
+          }
+
+          if (-not $ts) { throw "Tailscale not found" }
+          "TS_PATH=$ts" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          & $ts up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="gh-runner-$env:GITHUB_RUN_ID" --advertise-exit-node --accept-routes --unattended --reset
+          Start-Sleep -Seconds 15
+
+      - name: Show Info
+        shell: pwsh
+        run: |
+          Write-Host "`n=== AZURE INFO ==="
+          $ipinfo = Invoke-RestMethod https://ipinfo.io/json
+          $ipinfo | ConvertTo-Json -Depth 3
+
+      - name: Get Tailscale IP
+        shell: pwsh
+        run: |
+          $ts = $env:TS_PATH
+          $tsIP = & $ts ip -4
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Display RDP Info
+        shell: pwsh
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Tailscale IP : $env:TAILSCALE_IP"
+          Write-Host "Username     : $env:RDP_USER"
+          Write-Host "Password     : $env:RDP_PASS"
+          Write-Host "=========================`n"
+
+      - name: Keep Alive
+        shell: pwsh
+        run: |
+          while ($true) {
+              Write-Host "[$(Get-Date)] Active"
+              Start-Sleep -Seconds 600
+          }
+
+      - name: Cleanup
+        if: always()
+        shell: pwsh
+        run: |
+          $ts = $env:TS_PATH
+          if ($ts -and (Test-Path $ts)) {
+              & $ts logout
+          }

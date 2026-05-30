@@ -3,7 +3,9 @@ name: RDP-Kali
 on:
   workflow_dispatch:
   schedule:
-    - cron: '23 */4 * * *'
+    - cron: '0 */4 * * *'  # Jalan tiap 4 jam
+  repository_dispatch:
+    types: [kill-rdp, restart-rdp]
 
 concurrency:
   group: tailscale-exit-node
@@ -15,6 +17,20 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      - name: Check Kill Switch
+        shell: pwsh
+        run: |
+          # Cek file kill switch dari repo (bisa diubah manual lewat GitHub)
+          try {
+              $resp = Invoke-RestMethod -Uri "https://raw.githubusercontent.com/$env:GITHUB_REPOSITORY/main/.killswitch" -ErrorAction SilentlyContinue
+              if ($resp -eq "KILL") {
+                  Write-Host "[!] KILL SWITCH ACTIVE - Matikan" -ForegroundColor Red
+                  exit 1
+              }
+          } catch {
+              Write-Host "[+] Kill switch tidak ditemukan atau nonaktif" -ForegroundColor Green
+          }
+
       - name: Enable RDP
         shell: pwsh
         run: |
@@ -27,6 +43,7 @@ jobs:
         run: |
           try { Remove-LocalUser -Name "AdminRDP" -ErrorAction SilentlyContinue } catch {}
           
+          # Password random biar aman
           $chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
           $password = -join ((1..16) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
           $password = $password + "A1!"
@@ -38,27 +55,6 @@ jobs:
           
           "RDP_USER=AdminRDP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "RDP_PASS=$password" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Setup WSL Kali Linux
-        shell: pwsh
-        run: |
-          Write-Host "[1] Install WSL Kali Linux..."
-          wsl --install -d kali-linux
-          Start-Sleep -Seconds 15
-          
-          Write-Host "[2] Setup user RDP..."
-          wsl -d kali-linux -u root bash -c "useradd -m -s /bin/bash RDP && echo 'RDP:kali' | chpasswd && usermod -aG sudo RDP"
-          wsl -d kali-linux -u root bash -c "echo -e '[user]\ndefault=RDP' > /etc/wsl.conf"
-          wsl -t kali-linux
-          Start-Sleep -Seconds 3
-          
-          Write-Host "[3] Update & upgrade Kali..."
-          wsl -d kali-linux -u root bash -c "export DEBIAN_FRONTEND=noninteractive && apt update -y && apt full-upgrade -y"
-          
-          Write-Host "[4] Install Kali tools..."
-          wsl -d kali-linux -u root bash -c "apt install -y kali-linux-headless 2>/dev/null"
-          
-          Write-Host "[+] KALI SIAP!"
 
       - name: Install Tailscale
         shell: pwsh
@@ -123,9 +119,4 @@ jobs:
 
       - name: Cleanup
         if: always()
-        shell: pwsh
-        run: |
-          $ts = $env:TS_PATH
-          if ($ts -and (Test-Path $ts)) {
-              & $ts logout
-          }
+        shell: pw

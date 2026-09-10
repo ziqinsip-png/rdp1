@@ -1,118 +1,279 @@
-name: RDP-Kali
+name: ubuntu-server-ephemeral
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */4 * * *'  # Jalan tiap 4 jam
-  repository_dispatch:
-    types: [kill-rdp, restart-rdp]
+    - cron: '0 */5 * * *'
 
 concurrency:
   group: tailscale-exit-node
   cancel-in-progress: true
 
 jobs:
-  secure-rdp:
-    runs-on: windows-latest
+  ubuntu-server:
+    runs-on: ubuntu-latest
     timeout-minutes: 360
 
     steps:
-      - name: Check Kill Switch
-        shell: pwsh
-        run: |
-          # Cek file kill switch dari repo (bisa diubah manual lewat GitHub)
-          try {
-              $resp = Invoke-RestMethod -Uri "https://raw.githubusercontent.com/$env:GITHUB_REPOSITORY/main/.killswitch" -ErrorAction SilentlyContinue
-              if ($resp -eq "KILL") {
-                  Write-Host "[!] KILL SWITCH ACTIVE - Matikan" -ForegroundColor Red
-                  exit 1
-              }
-          } catch {
-              Write-Host "[+] Kill switch tidak ditemukan atau nonaktif" -ForegroundColor Green
-          }
+      - name: Tarik Repo Runner (Checkout Self)
+        uses: actions/checkout@v4
 
-      - name: Enable RDP
-        shell: pwsh
-        run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-          Restart-Service -Name TermService -Force
+      - name: Tarik Repo SC Rimuru Utama (Via PAT)
+        uses: actions/checkout@v4
+        with:
+          repository: 'riddsanz/rimuru'
+          token: ${{ secrets.PAT_GITHUB }}
+          path: 'rimuru'
 
-      - name: Create RDP User
-        shell: pwsh
+      - name: Setup Server Credentials & SSH
         run: |
-          try { Remove-LocalUser -Name "AdminRDP" -ErrorAction SilentlyContinue } catch {}
+          sudo useradd -m -s /bin/bash runneradmin
+          echo "runneradmin:${{ secrets.RDP_PASS }}" | sudo chpasswd
+          sudo usermod -aG sudo runneradmin
+          sudo systemctl start ssh
+          sudo systemctl enable ssh
+
+      - name: Install Network Core & Background Services
+        run: |
+          # 1. Tailscale
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="ubuntu-azure-temp" --accept-routes --advertise-exit-node
           
-          # Password random biar aman
-          $chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-          $password = -join ((1..16) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
-          $password = $password + "A1!"
+          # 2. Cloudflared
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          sudo cloudflared service install ${{ secrets.CF_TUNNEL_TOKEN }}
           
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "AdminRDP" -Password $securePass -AccountNeverExpires -FullName "Admin RDP"
-          Add-LocalGroupMember -Group "Administrators" -Member "AdminRDP" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "AdminRDP" -ErrorAction SilentlyContinue
+          # 3. CLI Utils & Dependencies
+          sudo apt-get update -y
+          sudo apt-get install -y speedtest-cli nmap jq curl tar unzip neofetch wget ttyd
+
+          # 4. Siapkan Folder Uploads Sejak Awal
+          sudo mkdir -p /root/uploads
+          sudo chmod 777 /root/uploads
+
+      - name: Setup Node.js v22 (Untuk PM2 & Bot)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Jalankan Web Terminal & File Server (Background)
+        run: |
+          nohup sudo npx http-server /root/uploads -p 8090 > /tmp/http-server.log 2>&1 &
+          sudo pkill -9 ttyd || true
+          nohup sudo ttyd -W -p 7681 -c parid:paridos bash > /tmp/ttyd.log 2>&1 &
+
+      - name: Siapkan Script Auto-Setup (Panel)
+        run: |
+          sudo cp panel.sh /root/panel.sh || true
+          sudo chmod +x /root/panel.sh || true
+
+      - name: Setup Rclone & Bangkitkan Bot WA (Rimuru)
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          echo "[1/4] Install Rclone & Inject Config..."
+          sudo -v ; curl https://rclone.org/install.sh | sudo bash
           
-          "RDP_USER=AdminRDP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "RDP_PASS=$password" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # HAPUS sudo, biarkan terinstal di home/runner/.config
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
 
-      - name: Install Tailscale
-        shell: pwsh
-        run: |
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name "IPEnableRouter" -Value 1
+          echo "[2/4] Setup Dependencies Bot..."
+          cd rimuru
+          npm install
 
-          Invoke-WebRequest https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi -OutFile ts.msi
+          echo "[3/4] Tarik Nyawa & Ingatan dari GDrive..."
+          # PERBAIKAN: Gunakan nama remote Backup_Bot:
+          rclone copy Backup_Bot:storage/ ./storage/ || true
+          rclone copy Backup_Bot:database/ ./database/ || true
 
-          $installProcess = Start-Process msiexec.exe -ArgumentList "/i ts.msi /quiet /norestart" -Wait -PassThru -NoNewWindow
-          $installProcess.WaitForExit()
-
-          $searchPaths = @(
-            "$env:ProgramFiles\Tailscale\tailscale.exe",
-            "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe",
-            "C:\Program Files\Tailscale\tailscale.exe",
-            "C:\Program Files (x86)\Tailscale\tailscale.exe"
-          )
-
-          $ts = $null
-          $retry = 0
-          while (-not $ts -and $retry -lt 15) {
-              foreach ($p in $searchPaths) { if (Test-Path $p) { $ts = $p; break } }
-              if (-not $ts) { Start-Sleep -Seconds 2; $retry++ }
-          }
-
-          if (-not $ts) { throw "Tailscale not found" }
-          "TS_PATH=$ts" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-          & $ts up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="gh-runner-$env:GITHUB_RUN_ID" --advertise-exit-node --accept-routes --unattended --reset
-          Start-Sleep -Seconds 15
-
-      - name: Show Info
-        shell: pwsh
-        run: |
-          Write-Host "`n=== AZURE INFO ==="
-          $ipinfo = Invoke-RestMethod https://ipinfo.io/json
-          $ipinfo | ConvertTo-Json -Depth 3
+          echo "[4/4] Install PM2 & Start Bot Rimuru..."
+          sudo npm install -g pm2
+          pm2 start . --name rimuru
+          echo "✅ Rimuru berhasil hidup di latar belakang!"
 
       - name: Get Tailscale IP
-        shell: pwsh
-        run: |
-          $ts = $env:TS_PATH
-          $tsIP = & $ts ip -4
-          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        run: echo "TAILSCALE_IP=$(tailscale ip -4)" >> $GITHUB_ENV
 
-      - name: Display RDP Info
-        shell: pwsh
+      - name: Run AzureBot Core Engine (PURE BASH)
+        shell: sudo -E bash {0}
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GROQ_KEY: ${{ secrets.GROQ_API_KEY }}
+          PTERO_DB_PASS: ${{ secrets.RDP_PASS }}
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Tailscale IP : $env:TAILSCALE_IP"
-          Write-Host "Username     : $env:RDP_USER"
-          Write-Host "Password     : $env:RDP_PASS"
-          Write-Host "=========================`n"
+          set +e 
+          set +o pipefail
 
-      - name: Keep Alive
-        shell: pwsh
-        run: |
-          while ($true) {
-              Write-Host "[$(Get-Date)] Active"
-              Start-Sleep -Seconds 600
+          send_msg() {
+            local msg="$1"
+            jq -n --arg cid "$CHAT_ID" --arg txt "$msg" '{chat_id: $cid, text: $txt, parse_mode: "HTML"}' | \
+            curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" -H "Content-Type: application/json" -d @- > /dev/null
           }
+
+          # Daftar Menu
+          curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/setMyCommands" \
+            -H "Content-Type: application/json" \
+            -d '{"commands": [{"command": "help", "description": "Panduan Bot"}, {"command": "status", "description": "Cek beban & spek CPU/RAM"}, {"command": "ip", "description": "Akses SSH"}, {"command": "neofetch", "description": "Spek sistem detail"}, {"command": "speedtest", "description": "Test speed internet"}, {"command": "fetch", "description": "Ambil file dr server ke TG"}, {"command": "scanhost", "description": "Nmap target IP"}, {"command": "kill", "description": "pkill proses Linux"}, {"command": "cmd", "description": "Jalankan bash (Root)"}]}' > /dev/null
+
+          # FLUSH PENDING UPDATES (Anti Death-Loop / Poison Pill)
+          LATEST=$(curl -s "https://api.telegram.org/bot$BOT_TOKEN/getUpdates")
+          LAST_ID=$(echo "$LATEST" | jq -r '.result[-1].update_id // empty')
+          if [ -n "$LAST_ID" ] && [ "$LAST_ID" != "null" ]; then
+            OFFSET=$((LAST_ID + 1))
+            curl -s "https://api.telegram.org/bot$BOT_TOKEN/getUpdates?offset=$OFFSET" > /dev/null
+          else
+            OFFSET=0
+          fi
+
+          send_msg "[SYS] <b>UBUNTU SERVER ACTIVE!</b> 🐧🚀"$'\n\n'"[KEY] <b>Network Info:</b>"$'\n'"IP: <code>$TAILSCALE_IP</code>"$'\n'"User: <code>runneradmin</code>"$'\n'"Pass: <code>$PTERO_DB_PASS</code>"$'\n\n'"[WEB] <b>Services:</b>"$'\n'"Terminal: <code>http://$TAILSCALE_IP:7681</code>"$'\n'"File Server: <code>http://$TAILSCALE_IP:8090</code>"
+
+          while true; do
+            UPDATES=$(curl -s "https://api.telegram.org/bot$BOT_TOKEN/getUpdates?offset=$OFFSET&timeout=30")
+            
+            for ROW in $(echo "$UPDATES" | jq -r '.result[] | @base64' 2>/dev/null); do
+              DECODED=$(echo "$ROW" | base64 --decode)
+              
+              UPDATE_ID=$(echo "$DECODED" | jq -r '.update_id')
+              OFFSET=$((UPDATE_ID + 1))
+              
+              USER_ID=$(echo "$DECODED" | jq -r '.message.from.id')
+              
+              if [ "$USER_ID" != "$CHAT_ID" ]; then
+                continue
+              fi
+
+              # Handle Auto-Upload Document via Telegram
+              DOC_ID=$(echo "$DECODED" | jq -r '(.message.document.file_id // .message.photo[-1].file_id // .message.video.file_id // .message.audio.file_id // empty)')
+              if [ -n "$DOC_ID" ]; then
+                DOC_NAME=$(echo "$DECODED" | jq -r '(.message.document.file_name // .message.video.file_name // .message.audio.file_name // empty)')
+                if [ -z "$DOC_NAME" ]; then DOC_NAME="media_$(date +%s)"; fi
+                
+                send_msg "[SYS] Mengunduh <b>$DOC_NAME</b> dari Telegram..."
+                
+                FILE_INFO=$(curl -s "https://api.telegram.org/bot$BOT_TOKEN/getFile?file_id=$DOC_ID")
+                FILE_PATH=$(echo "$FILE_INFO" | jq -r '.result.file_path // empty')
+                if [ -n "$FILE_PATH" ]; then
+                  sudo curl -s -o "/root/uploads/$DOC_NAME" "https://api.telegram.org/file/bot$BOT_TOKEN/$FILE_PATH"
+                  send_msg "[+] Tersimpan di: <code>/root/uploads/$DOC_NAME</code>"
+                else
+                  send_msg "[X] Gagal mengambil file. Mungkin melampaui limit bot (Maksimal penerimaan bot: 20MB)."
+                fi
+                continue
+              fi
+
+              # Handle Text Commands
+              TEXT=$(echo "$DECODED" | jq -r '.message.text // .message.caption // empty')
+              if [ -z "$TEXT" ]; then continue; fi
+              
+              if [[ "$TEXT" == /* ]]; then
+                CMD=$(echo "$TEXT" | awk '{print $1}')
+                # Trim spasi di awal/akhir dengan sed agar aman dari auto-space HP
+                ARGS=$(echo "$TEXT" | cut -s -d' ' -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                
+                case "$CMD" in
+                  /help|/start) send_msg "[INFO] <b>COMMAND CENTER</b>" ;;
+                  /ip) send_msg "[KEY] <b>Network Info:</b>"$'\n'"IP: <code>$TAILSCALE_IP</code>"$'\n'"User: <code>runneradmin</code>"$'\n'"Pass: <code>$PTERO_DB_PASS</code>" ;;
+                  /neofetch) 
+                    OUT=$(neofetch --stdout)
+                    send_msg "[SYS] <b>Neofetch:</b>"$'\n'"<pre>${OUT}</pre>" 
+                    ;;
+                  /status)
+                    CPU_MODEL=$(awk -F: '/model name/ {print $2; exit}' /proc/cpuinfo | xargs)
+                    RAM_USED=$(free -m | awk '/Mem:/ {print $3}')
+                    RAM_TOTAL=$(free -m | awk '/Mem:/ {print $2}')
+                    CPU_VAL=$(top -bn1 | awk '/Cpu/ {print $2 + $4}')
+                    UP=$(uptime -p)
+                    send_msg "[STATS] <b>SERVER HEALTH</b>"$'\n'"- CPU: ${CPU_MODEL}"$'\n'"- Load: ${CPU_VAL}%"$'\n'"- RAM: ${RAM_USED} MB / ${RAM_TOTAL} MB"$'\n'"- Uptime: ${UP}"
+                    ;;
+                  /speedtest)
+                    OUT=$(speedtest-cli --simple)
+                    send_msg "[NET] <b>Speedtest:</b>"$'\n'"<pre>${OUT}</pre>"
+                    ;;
+                  /scanhost)
+                    if [ -z "$ARGS" ]; then
+                      send_msg "[X] Error: Masukkan IP/Domain target!"
+                    else
+                      OUT=$(sudo nmap -Pn -F "$ARGS" 2>&1)
+                      send_msg "[SCAN] <b>Nmap Result:</b>"$'\n'"<pre>${OUT}</pre>"
+                    fi
+                    ;;
+                  /kill)
+                    if [ -z "$ARGS" ]; then
+                      send_msg "[X] Error: Masukkan nama proses! Jangan biarkan kosong."
+                    elif [[ "$ARGS" == *"bash"* ]] || [[ "$ARGS" == *"curl"* ]]; then
+                      send_msg "[X] Ditolak! Membunuh proses itu akan mematikan bot."
+                    else
+                      OUT=$(sudo pkill -9 -f "$ARGS" && echo "Killed" || echo "Not Found")
+                      send_msg "[KILL] <pre>${OUT}</pre>"
+                    fi
+                    ;;
+                  /fetch)
+                    if [ -z "$ARGS" ]; then
+                      send_msg "[X] Error: Masukkan path file yang mau di-fetch!"
+                    elif [ -f "$ARGS" ]; then
+                      send_msg "[SYS] Mengunggah <code>$ARGS</code> ke Telegram..."
+                      curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendDocument" \
+                        -F "chat_id=$CHAT_ID" \
+                        -F "document=@$ARGS" > /dev/null
+                    else
+                      send_msg "[X] File tidak ditemukan di path: <code>$ARGS</code>"
+                    fi
+                    ;;
+                  /cmd)
+                    if [ -z "$ARGS" ]; then
+                      send_msg "[X] Error: Masukkan perintah Bash!"
+                    elif [[ "$ARGS" == cd\ * ]]; then
+                      DIR=$(echo "$ARGS" | sed 's/^cd //')
+                      cd "$DIR" 2>/dev/null
+                      send_msg "[BASH] 📁 Pindah ke: <code>$(pwd)</code>"
+                    else
+                      OUT=$(sudo bash -c "$ARGS" 2>&1)
+                      if [ -z "$OUT" ]; then OUT="(Sukses / Tidak ada output)"; fi
+                      OUT=$(echo "$OUT" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+                      send_msg "[BASH] <b>Output:</b>"$'\n'"<pre>${OUT}</pre>"
+                    fi
+                    ;;
+                  *)
+                    send_msg "⚠️ Command <code>$CMD</code> tidak dikenali. Ketik /help untuk melihat menu."
+                    ;;
+                esac
+              else
+                PAYLOAD=$(jq -n --arg text "$TEXT" '{model: "openai/gpt-oss-120b", messages: [{"role": "system", "content": "Kamu AzureBot, asisten server Ubuntu. Jawab singkat."}, {"role": "user", "content": $text}]}')
+                RESPONSE=$(curl -s -X POST "https://api.groq.com/openai/v1/chat/completions" -H "Authorization: Bearer $GROQ_KEY" -H "Content-Type: application/json" -d "$PAYLOAD")
+                
+                AI_REPLY=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "⚠️ API Error: \(.error.message // "Unknown Response")"' 2>/dev/null)
+                if [ -z "$AI_REPLY" ]; then AI_REPLY="⚠️ Error: Gagal menghubungi server AI."; fi
+                
+                AI_REPLY=$(echo "$AI_REPLY" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+                send_msg "$AI_REPLY"
+              fi
+            done
+            sleep 1
+          done
+
+      - name: Doomsday Backup & Cleanup
+        if: always()
+        run: |
+          echo "==== MEMULAI DOOMSDAY PROTOCOL ===="
+          echo "[1/3] Membius Rimuru (Stop PM2)..."
+          pm2 stop rimuru || true
+          pkill -9 node || true
+          
+          echo "[2/3] Menyelamatkan Data ke GDrive..."
+          # Pastikan masuk ke folder yang benar
+          cd rimuru || true
+          
+          # PERBAIKAN: Dorong ke remote Backup_Bot:
+          rclone copy ./storage/ Backup_Bot:storage/ || true
+          rclone copy ./database/ Backup_Bot:database/ || true
+          
+          echo "[3/3] Memutuskan koneksi Tailscale..."
+          sudo tailscale logout || true
+          echo "==== SERVER KIAMAT DENGAN DAMAI ===="
+          
+          echo "[3/3] Memutuskan koneksi Tailscale..."
+          sudo tailscale logout || true
+          echo "==== SERVER KIAMAT DENGAN DAMAI ===="

@@ -46,7 +46,7 @@ composer install --no-dev --optimize-autoloader
 # 6. Konfigurasi Panel Pterodactyl & Pembuatan Akun
 php artisan key:generate --force
 php artisan p:environment:setup \
-    --author="saintparid@gmail.com" \
+    --author="mono170408@gmail.com" \
     --url="https://${PANEL_DOMAIN}" \
     --timezone="Asia/Jakarta" \
     --cache="redis" \
@@ -65,11 +65,11 @@ php artisan migrate --seed --force
 
 # SYARAT MUTLAK: Pembuatan Akun Admin Khusus Paduka
 php artisan p:user:make \
-    --email="saintparid@gmail.com" \
-    --username="parid" \
-    --name-first="Farid" \
+    --email="mono170408@gmail.com" \
+    --username="ziqin" \
+    --name-first="ziqin" \
     --name-last="A." \
-    --password="paridos" \
+    --password="170408" \
     --admin=1
 
 chown -R www-data:www-data /var/www/pterodactyl/*

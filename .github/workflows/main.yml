@@ -1,72 +1,177 @@
-#!/bin/bash
-# =================================================================
-# PTERODACTYL AUTO SETUP v4.0
-# Untuk: Ubuntu 22.04 / 24.04 (fresh VPS)
-# Jalankan: SETUP_DB_PASS='passwordku' bash setup.sh
-# =================================================================
+name: RDP-FullSetup-withScript
 
-export DEBIAN_FRONTEND=noninteractive
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *' 
 
-PANEL_DOMAIN="panel.paridx.my.id"
-WINGS_DOMAIN="wings.paridx.my.id"
-EMAIL="saintparid@gmail.com"
-ADMIN_EMAIL="saintparid@gmail.com"
-ADMIN_USER="parid"
-ADMIN_PASS="paridos"
-DB_PASS="${SETUP_DB_PASS:?Error: jalankan dengan SETUP_DB_PASS='password' bash setup.sh}"
+concurrency:
+  group: tailscale-exit-node
+  cancel-in-progress: true
 
-set -e  # berhenti jika ada error
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
 
-echo -e "\e[36m[1/9] Update sistem & install dependensi...\e[0m"
-apt update -y
-apt upgrade -y
-apt install -y software-properties-common curl apt-transport-https \
-    ca-certificates gnupg tar unzip redis-server mariadb-server nginx \
-    certbot python3-certbot-nginx git fail2ban
+    steps:
 
-systemctl enable --now fail2ban
+      - name: Enable RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
 
-echo -e "\e[36m[2/9] Install Docker...\e[0m"
-if ! command -v docker &>/dev/null; then
-    curl -fsSL https://get.docker.com | sh
-fi
-systemctl enable --now docker
-docker network create pterodactyl_nw 2>/dev/null || true
+      - name: Create RDP User
+        shell: pwsh
+        run: |
+          $password = -join ((33..126) | Get-Random -Count 20 | ForEach-Object {[char]$_})
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          "RDP_USER=RDP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RDP_PASS=$password" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-echo -e "\e[36m[3/9] Install PHP 8.2...\e[0m"
-LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php
-apt update -y
-apt install -y php8.2 php8.2-{common,cli,gd,mysql,mbstring,bcmath,xml,fpm,curl,zip}
+      - name: Create Desktop Setup Script
+        shell: pwsh
+        run: |
+          $ps1 = "C:\Users\Public\Desktop\Setup.ps1"
+          $bat = "C:\Users\Public\Desktop\Setup-Workspace.bat"
 
-echo -e "\e[36m[4/9] Setup database MariaDB...\e[0m"
-systemctl enable --now mariadb
-mysql -u root <<SQL
-CREATE USER IF NOT EXISTS 'pterodactyl'@'127.0.0.1' IDENTIFIED BY '${DB_PASS}';
-CREATE DATABASE IF NOT EXISTS panel;
-GRANT ALL PRIVILEGES ON panel.* TO 'pterodactyl'@'127.0.0.1' WITH GRANT OPTION;
-FLUSH PRIVILEGES;
-SQL
+          $lines = @()
+          $lines += 'Write-Host "1. Mengaktifkan Dark Mode..." -ForegroundColor Cyan'
+          $lines += 'Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "AppsUseLightTheme" -Value 0'
+          $lines += 'Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "SystemUsesLightTheme" -Value 0'
+          $lines += ''
+          $lines += 'Write-Host "2. Mengunduh dan memasang Wallpaper 4K..." -ForegroundColor Cyan'
+          $lines += '$url = "https://4kwallpapers.com/images/wallpapers/windows-11-dark-mode-abstract-background-black-background-7680x4320-8710.png"'
+          $lines += '$img = "$env:TEMP\wallpaper.png"'
+          $lines += 'Invoke-WebRequest -Uri $url -OutFile $img'
+          $lines += ''
+          $lines += 'Add-Type -TypeDefinition @"'
+          $lines += 'using System;'
+          $lines += 'using System.Runtime.InteropServices;'
+          $lines += 'public class WP {'
+          $lines += '    [DllImport("user32.dll", CharSet=CharSet.Auto)]'
+          $lines += '    public static extern int SystemParametersInfo(int uA, int uP, string lpv, int fu);'
+          $lines += '    public static void Set(string p) {'
+          $lines += '        SystemParametersInfo(20, 0, p, 3);'
+          $lines += '    }'
+          $lines += '}'
+          $lines += '"@'
+          $lines += '[WP]::Set($img)'
+          $lines += ''
+          $lines += 'Write-Host "3. Menginstal Brave Browser & VS Code..." -ForegroundColor Cyan'
+          $lines += 'choco install brave vscode -y'
+          $lines += ''
+          $lines += 'Write-Host "4. Menginstal Ubuntu 22.04 LTS (Background)..." -ForegroundColor Cyan'
+          $lines += 'wsl --install -d Ubuntu-22.04 --no-launch'
+          $lines += 'Start-Sleep -Seconds 15'
+          $lines += ''
+          $lines += 'Write-Host "5. Konfigurasi WSL (User RDP, Password root) & Instalasi Paket..." -ForegroundColor Cyan'
+          $lines += 'wsl -d Ubuntu-22.04 -u root bash -c "useradd -m -s /bin/bash RDP"'
+          $lines += 'wsl -d Ubuntu-22.04 -u root bash -c "echo ''RDP:root'' | chpasswd"'
+          $lines += 'wsl -d Ubuntu-22.04 -u root bash -c "usermod -aG sudo RDP"'
+          $lines += 'wsl -d Ubuntu-22.04 -u root bash -c "echo -e ''[user]\ndefault=RDP'' > /etc/wsl.conf"'
+          $lines += 'wsl -t Ubuntu-22.04'
+          $lines += 'Start-Sleep -Seconds 5'
+          $lines += 'wsl -d Ubuntu-22.04 -u root bash -c "apt update -y && DEBIAN_FRONTEND=noninteractive apt upgrade -y && DEBIAN_FRONTEND=noninteractive apt install neofetch nmap -y"'
+          $lines += ''
+          $lines += 'Write-Host "`n=============================================" -ForegroundColor Green'
+          $lines += 'Write-Host "Semua setup berhasil! Silakan nikmati Desktop-mu." -ForegroundColor Green'
+          $lines += 'Write-Host "=============================================" -ForegroundColor Green'
+          $lines += 'pause'
 
-echo -e "\e[36m[5/9] Download & install panel Pterodactyl...\e[0m"
-mkdir -p /var/www/pterodactyl
-cd /var/www/pterodactyl
-curl -Lo panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
-tar -xzvf panel.tar.gz
-chmod -R 755 storage/* bootstrap/cache/
+          $ps1Code = $lines -join "`r`n"
+          Set-Content -Path $ps1 -Value $ps1Code -Encoding UTF8
 
-curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
-cp .env.example .env
-composer install --no-dev --optimize-autoloader
+          $batLines = @()
+          $batLines += '@echo off'
+          $batLines += '>nul 2>&1 "%SYSTEMROOT%\system32\cacls.exe" "%SYSTEMROOT%\system32\config\system"'
+          $batLines += "if '%errorlevel%' NEQ '0' ("
+          $batLines += '    echo Meminta hak akses Administrator untuk setup...'
+          $batLines += '    echo Set UAC = CreateObject^("Shell.Application"^) > "%temp%\getadmin.vbs"'
+          $batLines += '    echo UAC.ShellExecute "%~s0", "", "", "runas", 1 >> "%temp%\getadmin.vbs"'
+          $batLines += '    "%temp%\getadmin.vbs"'
+          $batLines += '    exit /B'
+          $batLines += ')'
+          $batLines += 'if exist "%temp%\getadmin.vbs" ( del "%temp%\getadmin.vbs" )'
+          $batLines += 'powershell.exe -ExecutionPolicy Bypass -WindowStyle Normal -File "C:\Users\Public\Desktop\Setup.ps1"'
 
-echo -e "\e[36m[6/9] Konfigurasi panel & buat akun admin...\e[0m"
-php artisan key:generate --force
-php artisan p:environment:setup \
-    --author="${EMAIL}" \
-    --url="https://${PANEL_DOMAIN}" \
-    --timezone="Asia/Jakarta" \
-    --cache="redis" \
-    --session="database" \
-    --queue="redis" \
-    --telemetry=false
+          $batCode = $batLines -join "`r`n"
+          Set-Content -Path $bat -Value $batCode -Encoding ASCII
 
-php
+      - name: Install and Connect Tailscale
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name "IPEnableRouter" -Value 1
+
+          Write-Host "Mengunduh Tailscale..."
+          Invoke-WebRequest https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi -OutFile ts.msi
+
+          $installProcess = Start-Process msiexec.exe -ArgumentList "/i ts.msi /quiet /norestart" -Wait -PassThru -NoNewWindow
+          $installProcess.WaitForExit()
+
+          $searchPaths = @(
+            "$env:ProgramFiles\Tailscale\tailscale.exe",
+            "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe",
+            "C:\Program Files\Tailscale\tailscale.exe",
+            "C:\Program Files (x86)\Tailscale\tailscale.exe"
+          )
+
+          $ts = $null
+          $retry = 0
+          while (-not $ts -and $retry -lt 15) {
+              foreach ($p in $searchPaths) { if (Test-Path $p) { $ts = $p; break } }
+              if (-not $ts) { Start-Sleep -Seconds 2; $retry++ }
+          }
+
+          if (-not $ts) { throw "Tailscale binary not found after installation" }
+          "TS_PATH=$ts" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          # HAPUS --advertise-tags biar auth key kamu bisa dipake
+          & $ts up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="gh-runner-$env:GITHUB_RUN_ID" --advertise-exit-node --accept-routes --unattended --reset
+          Start-Sleep -Seconds 15
+
+      - name: Show Azure Public Info
+        shell: pwsh
+        run: |
+          Write-Host "`n=== AZURE PUBLIC INFO ==="
+          $ipinfo = Invoke-RestMethod https://ipinfo.io/json
+          $ipinfo | ConvertTo-Json -Depth 3
+
+      - name: Get Tailscale IP
+        shell: pwsh
+        run: |
+          $ts = $env:TS_PATH
+          $tsIP = & $ts ip -4
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Display RDP Info
+        shell: pwsh
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Tailscale IP : $env:TAILSCALE_IP"
+          Write-Host "Username     : $env:RDP_USER"
+          Write-Host "Password     : $env:RDP_PASS"
+          Write-Host "=========================`n"
+
+      - name: Keep Alive
+        shell: pwsh
+        run: |
+          while ($true) {
+              Write-Host "[$(Get-Date)] Exit Node Active"
+              Start-Sleep -Seconds 600
+          }
+
+      - name: Cleanup Tailscale (Graceful Exit)
+        if: always()
+        shell: pwsh
+        run: |
+          $ts = $env:TS_PATH
+          if ($ts -and (Test-Path $ts)) {
+              Write-Host "Membersihkan exit node dari dashboard..."
+              & $ts logout
+          }
